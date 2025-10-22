@@ -1,0 +1,18 @@
+{
+  "name": "monitor-whale-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitor hyperbot trader API and push changes to Telegram",
+  "main": "monitor-whale-api.js",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "node monitor-whale-api.js",
+    "start:once": "RUN_ONCE=1 node monitor-whale-api.js",
+    "test:telegram": "node test-telegram.js",
+    "debug:api": "node debug-api.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "undici": "^7.16.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "positions": [
+    {
+      "coin": "BTC",
+      "side": "Short",
+      "amount": 1151.41652,
+      "entryPrice": 111386.3,
+      "positionValue": 124440491.81552,
+      "unrealizedPnl": 3811538.413187,
+      "roe": 59.438254609999994,
+      "liquidationPrice": 119307.9321683289,
+      "leverage": "20X Cross",
+      "fundingFee": -8149903.403687
+    }
+  ],
+  "accountValue": 14649796.300954,
+  "totalPositionValue": 124440491.81552
+}

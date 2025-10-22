@@ -1,0 +1,350 @@
+#!/usr/bin/env node
+/*
+  Hyperliquid Whale Monitor -> Telegram
+
+  思路:
+  - 直接调用 Hyperliquid 官方 API (api-ui.hyperliquid.xyz)，获取持仓信息，检测变化后推送到 Telegram。
+  - 支持监控多个钱包地址，每个地址独立追踪状态。
+
+  环境变量:
+  - ADDRESSES=0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae,0x... (逗号分隔多个地址)
+  - ADDRESS=0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae (单地址，兼容旧配置)
+  - TELEGRAM_BOT_TOKEN=xxx
+  - TELEGRAM_CHAT_ID=-100xxxxx
+  - POLL_SECONDS=30
+  - API_URL (可选，默认: https://api-ui.hyperliquid.xyz/info)
+*/
+
+const fs = require('fs');
+const path = require('path');
+require('dotenv').config();
+
+// Proxy support (HTTP/HTTPS)
+try {
+  const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (proxyUrl) {
+    const { setGlobalDispatcher, ProxyAgent } = require('undici');
+    setGlobalDispatcher(new ProxyAgent(proxyUrl));
+    console.log(`[proxy] Using proxy: ${proxyUrl}`);
+  }
+} catch (_) {}
+
+// 支持多地址配置
+const ADDRESSES_STR = process.env.ADDRESSES || process.env.ADDRESS || '0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae';
+const ADDRESSES = ADDRESSES_STR.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const POLL_SECONDS = parseInt(process.env.POLL_SECONDS || '30', 10);
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const API_URL = process.env.API_URL || 'https://api-ui.hyperliquid.xyz/info';
+
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+  process.exit(1);
+}
+
+if (!ADDRESSES.length) {
+  console.error('No addresses to monitor. Set ADDRESS or ADDRESSES in .env');
+  process.exit(1);
+}
+
+console.log(`[config] 监控地址: ${ADDRESSES.join(', ')}`);
+console.log(`[config] API: ${API_URL}`);
+console.log(`[config] 轮询间隔: ${POLL_SECONDS}秒`);
+
+async function sendTelegram(text) {
+  const endpoint = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true };
+  const res = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!res.ok) { console.error('[telegram] 发送失败', res.status, await res.text()); }
+}
+
+// 每个地址独立的状态文件
+function getStateFile(address) {
+  return path.resolve(__dirname, `.hyperliquid_state_${address.slice(0, 10)}.json`);
+}
+
+function loadState(address) {
+  try {
+    const file = getStateFile(address);
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return { positions: [] };
+  }
+}
+
+function saveState(address, s) {
+  try {
+    const file = getStateFile(address);
+    fs.writeFileSync(file, JSON.stringify(s, null, 2));
+  } catch (e) {
+    console.error(`[state] 保存状态失败 ${address}:`, e.message);
+  }
+}
+
+function normalizeNumber(v) {
+  if (v == null) return null;
+  const t = String(v).replace(/[,\s]/g, '').replace(/^\$/, '');
+  const n = parseFloat(t);
+  return isNaN(n) ? null : n;
+}
+
+function formatNumber(num, decimals = 2) {
+  if (num == null) return '-';
+  const absNum = Math.abs(num);
+  if (absNum >= 1e6) return (num / 1e6).toFixed(decimals) + 'M';
+  if (absNum >= 1e3) return (num / 1e3).toFixed(decimals) + 'K';
+  return num.toFixed(decimals);
+}
+
+function keyOfPosition(p) {
+  return `${p.coin}|${p.side}`;
+}
+
+// 解析 Hyperliquid clearinghouseState 返回的持仓数据
+function parseHyperliquidPositions(data) {
+  if (!data || !data.assetPositions) return [];
+
+  return data.assetPositions.map(ap => {
+    const pos = ap.position;
+    const szi = parseFloat(pos.szi);
+    const side = szi < 0 ? 'Short' : 'Long';
+    const amount = Math.abs(szi);
+
+    // 解析杠杆
+    let leverage = '-';
+    if (pos.leverage) {
+      if (pos.leverage.type === 'cross') {
+        leverage = `${pos.leverage.value}X Cross`;
+      } else if (pos.leverage.type === 'isolated') {
+        leverage = `${pos.leverage.value}X Isolated`;
+      }
+    }
+
+    return {
+      coin: pos.coin,
+      side: side,
+      amount: amount,
+      entryPrice: parseFloat(pos.entryPx),
+      positionValue: parseFloat(pos.positionValue),
+      unrealizedPnl: parseFloat(pos.unrealizedPnl),
+      roe: parseFloat(pos.returnOnEquity) * 100, // 转换为百分比
+      liquidationPrice: parseFloat(pos.liquidationPx),
+      leverage: leverage,
+      fundingFee: pos.cumFunding?.sinceOpen ? parseFloat(pos.cumFunding.sinceOpen) : null
+    };
+  });
+}
+
+function diffPositions(prev, curr) {
+  const prevMap = new Map(prev.map(p => [keyOfPosition(p), p]));
+  const currMap = new Map(curr.map(p => [keyOfPosition(p), p]));
+  const added = [], removed = [], changed = [];
+
+  for (const [k, p] of currMap) {
+    if (!prevMap.has(k)) {
+      added.push(p);
+    } else {
+      const q = prevMap.get(k);
+      // 检查关键字段是否变化
+      const fields = ['amount', 'entryPrice', 'positionValue', 'unrealizedPnl', 'liquidationPrice'];
+      let mutate = false;
+      const changes = {};
+
+      for (const f of fields) {
+        const oldVal = q[f] ?? null;
+        const newVal = p[f] ?? null;
+        if (oldVal !== newVal && Math.abs(oldVal - newVal) > 0.0001) { // 容忍微小差异
+          mutate = true;
+          changes[f] = { old: oldVal, new: newVal };
+        }
+      }
+
+      if (mutate) {
+        changed.push({ before: q, after: p, changes });
+      }
+    }
+  }
+
+  for (const [k, p] of prevMap) {
+    if (!currMap.has(k)) removed.push(p);
+  }
+
+  return { added, removed, changed };
+}
+
+// 获取指定地址的持仓数据
+async function fetchPositions(address) {
+  const payload = {
+    type: 'clearinghouseState',
+    user: address
+  };
+
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    throw new Error(`API returned ${res.status}: ${await res.text()}`);
+  }
+
+  const data = await res.json();
+  return {
+    positions: parseHyperliquidPositions(data),
+    accountValue: data.marginSummary?.accountValue ? parseFloat(data.marginSummary.accountValue) : null,
+    totalPositionValue: data.marginSummary?.totalNtlPos ? parseFloat(data.marginSummary.totalNtlPos) : null
+  };
+}
+
+// 格式化持仓信息为 Telegram 消息
+function formatPosition(p) {
+  const pnlSign = p.unrealizedPnl >= 0 ? '+' : '';
+  const pnlEmoji = p.unrealizedPnl >= 0 ? '📈' : '📉';
+
+  // 做多/做空高亮显示
+  const sideEmoji = p.side === 'Long' ? '🟢' : '🔴';
+  const sideText = p.side === 'Long' ? '<b>【做多】</b>' : '<b>【做空】</b>';
+
+  return `${sideEmoji} ${sideText} <b>${p.coin}</b> | ${p.leverage}
+━━━━━━━━━━━━━━━━
+📊 仓位规模: ${formatNumber(p.amount, 4)} ${p.coin}
+💵 仓位价值: $${formatNumber(p.positionValue)}
+📍 开仓价格: $${formatNumber(p.entryPrice, 2)}
+⚠️  强平价格: $${formatNumber(p.liquidationPrice, 2)}
+${pnlEmoji} 当前盈亏: ${pnlSign}$${formatNumber(p.unrealizedPnl)} (${pnlSign}${p.roe.toFixed(2)}%)${p.fundingFee != null ? `\n💸 资金费率: $${formatNumber(p.fundingFee)}` : ''}`;
+}
+
+// 监控单个地址
+async function monitorAddress(address) {
+  const prev = loadState(address);
+
+  try {
+    const { positions, accountValue, totalPositionValue } = await fetchPositions(address);
+    const { added, removed, changed } = diffPositions(prev.positions || [], positions);
+
+    // 首次运行
+    if (!prev.positions || prev.positions.length === 0) {
+      saveState(address, { positions, accountValue, totalPositionValue });
+      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+      await sendTelegram(
+        `✅ <b>开始监控钱包</b>
+
+🏦 地址: <code>${shortAddr}</code>
+💵 账户价值: $${formatNumber(accountValue)}
+📊 持仓总值: $${formatNumber(totalPositionValue)}
+📍 当前持仓: ${positions.length} 个
+
+<a href="https://www.coinglass.com/hyperliquid/${address}">📈 查看详情</a>`
+      );
+      console.log(`[${shortAddr}] 初始化完成, ${positions.length} 个持仓`);
+      return;
+    }
+
+    // 检测到变化
+    if (added.length || removed.length || changed.length) {
+      saveState(address, { positions, accountValue, totalPositionValue });
+
+      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+      const lines = [`🚨 <b>巨鲸动向监控</b> 🚨\n`];
+
+      lines.push(`👤 地址: <code>${shortAddr}</code>`);
+      if (accountValue) {
+        lines.push(`💰 账户总值: $${formatNumber(accountValue)}`);
+        lines.push(`📊 持仓总值: $${formatNumber(totalPositionValue)}`);
+      }
+
+      lines.push('━━━━━━━━━━━━━━━━'); // 分隔线
+      lines.push(''); // 空行
+
+      if (added.length) {
+        lines.push(`➕ <b>新开仓位 (${added.length})</b>`);
+        added.forEach(p => lines.push(formatPosition(p)));
+        lines.push('');
+      }
+
+      if (removed.length) {
+        lines.push(`✂️ <b>平仓操作 (${removed.length})</b>`);
+        removed.forEach(p => {
+          const pnlSign = p.unrealizedPnl >= 0 ? '+' : '';
+          const pnlEmoji = p.unrealizedPnl >= 0 ? '✅' : '❌';
+          const sideEmoji = p.side === 'Long' ? '🟢' : '🔴';
+          const sideText = p.side === 'Long' ? '【做多】' : '【做空】';
+
+          lines.push(`${sideEmoji} ${sideText} <b>${p.coin}</b> - 已平仓`);
+          lines.push(`${pnlEmoji} 平仓盈亏: ${pnlSign}$${formatNumber(p.unrealizedPnl)} (${pnlSign}${p.roe.toFixed(2)}%)`);
+        });
+        lines.push('');
+      }
+
+      if (changed.length) {
+        lines.push(`♻️ <b>仓位变更 (${changed.length})</b>`);
+        changed.forEach(c => {
+          lines.push(formatPosition(c.after));
+          // 显示主要变化
+          const changeDesc = [];
+          if (c.changes.amount) changeDesc.push(`量: ${formatNumber(c.changes.amount.old, 4)}→${formatNumber(c.changes.amount.new, 4)}`);
+          if (c.changes.unrealizedPnl) {
+            const diff = c.changes.unrealizedPnl.new - c.changes.unrealizedPnl.old;
+            changeDesc.push(`盈亏变化: ${diff >= 0 ? '+' : ''}$${formatNumber(diff)}`);
+          }
+          if (changeDesc.length) lines.push(`  └ ${changeDesc.join(' | ')}`);
+        });
+        lines.push('');
+      }
+
+      // 添加跟单指引
+      lines.push('━━━━━━━━━━━━━━━━');
+      lines.push('💡 <b>跟单提示:</b>');
+      if (added.length) {
+        const hasLong = added.some(p => p.side === 'Long');
+        const hasShort = added.some(p => p.side === 'Short');
+        if (hasLong) lines.push('  🟢 检测到新做多仓位，关注入场时机');
+        if (hasShort) lines.push('  🔴 检测到新做空仓位，关注入场时机');
+      }
+      if (removed.length) {
+        lines.push('  ✂️ 检测到平仓操作，注意止盈/止损');
+      }
+
+      lines.push(`\n<a href="https://www.coinglass.com/hyperliquid/${address}">📈 查看完整持仓详情</a>`);
+
+      await sendTelegram(lines.join('\n'));
+      console.log(`[${shortAddr}] 变更: +${added.length} -${removed.length} ~${changed.length}`);
+    } else {
+      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+      console.log(`[${shortAddr}] 无变化, ${positions.length} 个持仓`);
+    }
+  } catch (e) {
+    const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+    console.error(`[${shortAddr}] 监控错误:`, e.message);
+  }
+}
+
+// 主循环: 监控所有地址
+async function loop() {
+  console.log(`[${new Date().toLocaleString('zh-CN')}] 开始轮询...`);
+
+  for (const address of ADDRESSES) {
+    await monitorAddress(address);
+    // 地址间稍微延迟，避免API限流
+    if (ADDRESSES.length > 1) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+}
+
+// Node 18+
+if (typeof fetch === 'undefined') {
+  global.fetch = (...args) => import('node-fetch').then(({default:f}) => f(...args));
+}
+
+(async () => {
+  await loop();
+  if (process.env.RUN_ONCE === '1') {
+    process.exit(0);
+  }
+  setInterval(loop, POLL_SECONDS * 1000);
+})();
