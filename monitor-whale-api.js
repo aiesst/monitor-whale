@@ -29,9 +29,15 @@ try {
   }
 } catch (_) {}
 
-// 支持多地址配置
+// 支持多地址配置，支持别名格式：地址:别名
 const ADDRESSES_STR = process.env.ADDRESSES || process.env.ADDRESS || '0xb317d2bc2d3d2df5fa441b5bae0ab9d8b07283ae';
-const ADDRESSES = ADDRESSES_STR.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const ADDRESSES_WITH_ALIAS = ADDRESSES_STR.split(',').map(s => {
+  const parts = s.trim().split(':');
+  const address = parts[0].trim().toLowerCase();
+  const alias = parts[1] ? parts[1].trim() : null;
+  return { address, alias };
+}).filter(item => item.address);
+
 const POLL_SECONDS = parseInt(process.env.POLL_SECONDS || '30', 10);
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -42,12 +48,12 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   process.exit(1);
 }
 
-if (!ADDRESSES.length) {
+if (!ADDRESSES_WITH_ALIAS.length) {
   console.error('No addresses to monitor. Set ADDRESS or ADDRESSES in .env');
   process.exit(1);
 }
 
-console.log(`[config] 监控地址: ${ADDRESSES.join(', ')}`);
+console.log(`[config] 监控地址: ${ADDRESSES_WITH_ALIAS.map(a => a.alias ? `${a.alias}(${a.address.slice(0,6)}...)` : a.address).join(', ')}`);
 console.log(`[config] API: ${API_URL}`);
 console.log(`[config] 轮询间隔: ${POLL_SECONDS}秒`);
 
@@ -219,28 +225,31 @@ ${pnlEmoji} 当前盈亏: ${pnlSign}$${formatNumber(p.unrealizedPnl)} (${pnlSign
 }
 
 // 监控单个地址
-async function monitorAddress(address) {
+async function monitorAddress(address, alias = null) {
   const prev = loadState(address);
 
   try {
     const { positions, accountValue, totalPositionValue } = await fetchPositions(address);
     const { added, removed, changed } = diffPositions(prev.positions || [], positions);
 
+    // 显示名称：优先使用别名，否则使用缩写地址
+    const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+    const displayName = alias || shortAddr;
+
     // 首次运行
     if (!prev.positions || prev.positions.length === 0) {
       saveState(address, { positions, accountValue, totalPositionValue });
-      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
       await sendTelegram(
         `✅ <b>开始监控钱包</b>
 
-🏦 地址: <code>${shortAddr}</code>
+${alias ? `🏷️ 名称: <b>${alias}</b>\n` : ''}🏦 地址: <code>${shortAddr}</code>
 💵 账户价值: $${formatNumber(accountValue)}
 📊 持仓总值: $${formatNumber(totalPositionValue)}
 📍 当前持仓: ${positions.length} 个
 
 <a href="https://www.coinglass.com/hyperliquid/${address}">📈 查看详情</a>`
       );
-      console.log(`[${shortAddr}] 初始化完成, ${positions.length} 个持仓`);
+      console.log(`[${displayName}] 初始化完成, ${positions.length} 个持仓`);
       return;
     }
 
@@ -248,9 +257,14 @@ async function monitorAddress(address) {
     if (added.length || removed.length || changed.length) {
       saveState(address, { positions, accountValue, totalPositionValue });
 
-      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
+      // 检测清仓：之前有仓位，现在全部平完
+      const isFullyClosed = (prev.positions && prev.positions.length > 0) && positions.length === 0;
+
       const lines = [`🚨 <b>巨鲸动向监控</b> 🚨\n`];
 
+      if (alias) {
+        lines.push(`🏷️ 名称: <b>${alias}</b>`);
+      }
       lines.push(`👤 地址: <code>${shortAddr}</code>`);
       if (accountValue) {
         lines.push(`💰 账户总值: $${formatNumber(accountValue)}`);
@@ -258,6 +272,13 @@ async function monitorAddress(address) {
       }
 
       lines.push('━━━━━━━━━━━━━━━━'); // 分隔线
+
+      // 清仓特殊提示
+      if (isFullyClosed) {
+        lines.push('');
+        lines.push('🎯 <b>【已清仓】所有持仓已平仓</b>');
+      }
+
       lines.push(''); // 空行
 
       if (added.length) {
@@ -299,27 +320,38 @@ async function monitorAddress(address) {
       // 添加跟单指引
       lines.push('━━━━━━━━━━━━━━━━');
       lines.push('💡 <b>跟单提示:</b>');
-      if (added.length) {
-        const hasLong = added.some(p => p.side === 'Long');
-        const hasShort = added.some(p => p.side === 'Short');
-        if (hasLong) lines.push('  🟢 检测到新做多仓位，关注入场时机');
-        if (hasShort) lines.push('  🔴 检测到新做空仓位，关注入场时机');
-      }
-      if (removed.length) {
-        lines.push('  ✂️ 检测到平仓操作，注意止盈/止损');
+      if (isFullyClosed) {
+        lines.push('  🎯 巨鲸已全部清仓，观望为主');
+      } else {
+        if (added.length) {
+          const hasLong = added.some(p => p.side === 'Long');
+          const hasShort = added.some(p => p.side === 'Short');
+          if (hasLong) lines.push('  🟢 检测到新做多仓位，关注入场时机');
+          if (hasShort) lines.push('  🔴 检测到新做空仓位，关注入场时机');
+        }
+        if (removed.length && !isFullyClosed) {
+          lines.push('  ✂️ 检测到平仓操作，注意止盈/止损');
+        }
       }
 
       lines.push(`\n<a href="https://www.coinglass.com/hyperliquid/${address}">📈 查看完整持仓详情</a>`);
 
       await sendTelegram(lines.join('\n'));
-      console.log(`[${shortAddr}] 变更: +${added.length} -${removed.length} ~${changed.length}`);
+
+      if (isFullyClosed) {
+        console.log(`[${displayName}] 🎯 已清仓: +${added.length} -${removed.length} ~${changed.length}`);
+      } else {
+        console.log(`[${displayName}] 变更: +${added.length} -${removed.length} ~${changed.length}`);
+      }
     } else {
-      const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
-      console.log(`[${shortAddr}] 无变化, ${positions.length} 个持仓`);
+      if (positions.length === 0) {
+        console.log(`[${displayName}] 无变化 (空仓)`);
+      } else {
+        console.log(`[${displayName}] 无变化, ${positions.length} 个持仓`);
+      }
     }
   } catch (e) {
-    const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
-    console.error(`[${shortAddr}] 监控错误:`, e.message);
+    console.error(`[${displayName}] 监控错误:`, e.message);
   }
 }
 
@@ -327,10 +359,10 @@ async function monitorAddress(address) {
 async function loop() {
   console.log(`[${new Date().toLocaleString('zh-CN')}] 开始轮询...`);
 
-  for (const address of ADDRESSES) {
-    await monitorAddress(address);
+  for (const item of ADDRESSES_WITH_ALIAS) {
+    await monitorAddress(item.address, item.alias);
     // 地址间稍微延迟，避免API限流
-    if (ADDRESSES.length > 1) {
+    if (ADDRESSES_WITH_ALIAS.length > 1) {
       await new Promise(r => setTimeout(r, 1000));
     }
   }

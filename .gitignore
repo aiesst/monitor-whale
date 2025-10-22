@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# State files (持仓状态缓存)
+.hyperliquid_state_*.json
+.hyperbot_api_state_*.json
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Temporary files
+tmp/
+temp/
