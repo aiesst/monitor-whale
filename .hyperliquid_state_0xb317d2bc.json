@@ -5,14 +5,14 @@
       "side": "Short",
       "amount": 2100.27103,
       "entryPrice": 111190.3,
-      "positionValue": 227087604.57669,
-      "unrealizedPnl": 6442197.70434,
-      "roe": 27.58619089,
-      "liquidationPrice": 123276.8461842459,
+      "positionValue": 225798038.16427,
+      "unrealizedPnl": 7731764.11676,
+      "roe": 33.10825446,
+      "liquidationPrice": 123282.0433970423,
       "leverage": "10X Cross",
-      "fundingFee": -33322.526507
+      "fundingFee": -44511.033406
     }
   ],
-  "accountValue": 36425053.851611,
-  "totalPositionValue": 227087604.57669
+  "accountValue": 37725808.708391,
+  "totalPositionValue": 225798038.16427
 }
