@@ -158,8 +158,8 @@ function diffPositions(prev, curr) {
       added.push(p);
     } else {
       const q = prevMap.get(k);
-      // 仅比较仓位规模（amount），忽略价格/盈亏等波动
-      const fields = ['amount'];
+      // 检查关键字段是否变化
+      const fields = ['amount', 'entryPrice', 'positionValue', 'unrealizedPnl', 'liquidationPrice'];
       let mutate = false;
       const changes = {};
 
@@ -361,11 +361,9 @@ async function monitorAddress(address, alias = null) {
     const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
     const displayName = alias || shortAddr;
 
-    // 首次运行 - 发送初始化消息
+    // 首次运行
     if (!prev.positions || prev.positions.length === 0) {
       saveState(address, { positions, accountValue, totalPositionValue });
-      lastReportTime.set(address, Date.now()); // 记录初始化时间
-
       await sendTelegram(
         `✅ <b>开始监控钱包</b>
 
@@ -380,56 +378,107 @@ ${alias ? `🏷️ 名称: <b>${alias}</b>\n` : ''}🏦 地址: <code>${shortAdd
       return;
     }
 
-    // 检测是否有变化
-    const hasChanges = added.length > 0 || removed.length > 0 || changed.length > 0;
+    // 检测到变化
+    if (added.length || removed.length || changed.length) {
+      saveState(address, { positions, accountValue, totalPositionValue });
 
-    // 始终保存最新状态（无论是否有变化）
-    saveState(address, { positions, accountValue, totalPositionValue });
+      // 检测清仓：之前有仓位，现在全部平完
+      const isFullyClosed = (prev.positions && prev.positions.length > 0) && positions.length === 0;
 
-    // 1. 如果有变化 -> 立即发送即时变化通知
-    if (hasChanges) {
-      const message = generateChangeAlert(
-        address,
-        alias,
-        positions,
-        accountValue,
-        totalPositionValue,
-        added,
-        removed,
-        changed
-      );
-      await sendTelegram(message);
-      console.log(`[${displayName}] 🚨 即时变化: +${added.length} -${removed.length} ~${changed.length}`);
+      const lines = [`🚨 <b>巨鲸动向监控</b> 🚨\n`];
+
+      if (alias) {
+        lines.push(`🏷️ 名称: <b>${alias}</b>`);
+      }
+      lines.push(`👤 地址: <code>${shortAddr}</code>`);
+      if (accountValue) {
+        lines.push(`💰 账户总值: $${formatNumber(accountValue)}`);
+        lines.push(`📊 持仓总值: $${formatNumber(totalPositionValue)}`);
+      }
+
+      lines.push('━━━━━━━━━━━━━━━━'); // 分隔线
+
+      // 清仓特殊提示
+      if (isFullyClosed) {
+        lines.push('');
+        lines.push('🎯 <b>【已清仓】所有持仓已平仓</b>');
+      }
+
+      lines.push(''); // 空行
+
+      if (added.length) {
+        lines.push(`➕ <b>新开仓位 (${added.length})</b>`);
+        added.forEach(p => lines.push(formatPosition(p)));
+        lines.push('');
+      }
+
+      if (removed.length) {
+        lines.push(`✂️ <b>平仓操作 (${removed.length})</b>`);
+        removed.forEach(p => {
+          const pnlSign = p.unrealizedPnl >= 0 ? '+' : '';
+          const pnlEmoji = p.unrealizedPnl >= 0 ? '✅' : '❌';
+          const sideEmoji = p.side === 'Long' ? '🟢' : '🔴';
+          const sideText = p.side === 'Long' ? '【做多】' : '【做空】';
+
+          lines.push(`${sideEmoji} ${sideText} <b>${p.coin}</b> - 已平仓`);
+          lines.push(`${pnlEmoji} 平仓盈亏: ${pnlSign}$${formatNumber(p.unrealizedPnl)} (${pnlSign}${p.roe.toFixed(2)}%)`);
+        });
+        lines.push('');
+      }
+
+      if (changed.length) {
+        lines.push(`♻️ <b>仓位变更 (${changed.length})</b>`);
+        changed.forEach(c => {
+          lines.push(formatPosition(c.after));
+          // 显示主要变化
+          const changeDesc = [];
+          if (c.changes.amount) changeDesc.push(`量: ${formatNumber(c.changes.amount.old, 4)}→${formatNumber(c.changes.amount.new, 4)}`);
+          if (c.changes.unrealizedPnl) {
+            const diff = c.changes.unrealizedPnl.new - c.changes.unrealizedPnl.old;
+            changeDesc.push(`盈亏变化: ${diff >= 0 ? '+' : ''}$${formatNumber(diff)}`);
+          }
+          if (changeDesc.length) lines.push(`  └ ${changeDesc.join(' | ')}`);
+        });
+        lines.push('');
+      }
+
+      // 添加跟单指引
+      lines.push('━━━━━━━━━━━━━━━━');
+      lines.push('💡 <b>跟单提示:</b>');
+      if (isFullyClosed) {
+        lines.push('  🎯 巨鲸已全部清仓，观望为主');
+      } else {
+        if (added.length) {
+          const hasLong = added.some(p => p.side === 'Long');
+          const hasShort = added.some(p => p.side === 'Short');
+          if (hasLong) lines.push('  🟢 检测到新做多仓位，关注入场时机');
+          if (hasShort) lines.push('  🔴 检测到新做空仓位，关注入场时机');
+        }
+        if (removed.length && !isFullyClosed) {
+          lines.push('  ✂️ 检测到平仓操作，注意止盈/止损');
+        }
+      }
+
+      lines.push(`\n<a href="https://www.coinglass.com/hyperliquid/${address}">📈 查看完整持仓详情</a>`);
+
+      await sendTelegram(lines.join('\n'));
+
+      if (isFullyClosed) {
+        console.log(`[${displayName}] 🎯 已清仓: +${added.length} -${removed.length} ~${changed.length}`);
+      } else {
+        console.log(`[${displayName}] 变更: +${added.length} -${removed.length} ~${changed.length}`);
+      }
+    } else {
+      if (positions.length === 0) {
+        console.log(`[${displayName}] 无变化 (空仓)`);
+      } else {
+        console.log(`[${displayName}] 无变化, ${positions.length} 个持仓`);
+      }
     }
-
-    // 2. 检查是否需要发送定时报告
-    const now = Date.now();
-    const lastReport = lastReportTime.get(address) || 0;
-    const minutesSinceLastReport = (now - lastReport) / (1000 * 60);
-
-    if (minutesSinceLastReport >= REPORT_INTERVAL_MINUTES) {
-      const reportMessage = generateScheduledReport(
-        address,
-        alias,
-        positions,
-        accountValue,
-        totalPositionValue
-      );
-      await sendTelegram(reportMessage);
-      lastReportTime.set(address, now);
-      console.log(`[${displayName}] 📊 定时报告已发送 (${positions.length}个持仓)`);
-    } else if (!hasChanges) {
-      // 无变化且不需要定时报告
-      const nextReportMinutes = Math.ceil(REPORT_INTERVAL_MINUTES - minutesSinceLastReport);
-      console.log(`[${displayName}] 无变化, ${positions.length} 个持仓 (下次报告: ${nextReportMinutes}分钟后)`);
-    }
-
   } catch (e) {
-    const displayName = alias || `${address.slice(0, 6)}...${address.slice(-4)}`;
     console.error(`[${displayName}] 监控错误:`, e.message);
   }
 }
-
 
 // 主循环: 监控所有地址
 async function loop() {
