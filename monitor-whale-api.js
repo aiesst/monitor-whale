@@ -351,6 +351,8 @@ function generateChangeAlert(address, alias, positions, accountValue, totalPosit
 
 // 监控单个地址
 async function monitorAddress(address, alias = null) {
+  const stateFilePath = getStateFile(address);
+  const isFirstRun = !fs.existsSync(stateFilePath);
   const prev = loadState(address);
 
   try {
@@ -361,8 +363,8 @@ async function monitorAddress(address, alias = null) {
     const shortAddr = `${address.slice(0, 6)}...${address.slice(-4)}`;
     const displayName = alias || shortAddr;
 
-    // 首次运行 - 发送初始化消息
-    if (!prev.positions || prev.positions.length === 0) {
+    // 首次运行：以“状态文件是否存在”为准，避免空仓时重复初始化
+    if (isFirstRun) {
       saveState(address, { positions, accountValue, totalPositionValue });
       lastReportTime.set(address, Date.now()); // 记录初始化时间
 
@@ -382,6 +384,11 @@ ${alias ? `🏷️ 名称: <b>${alias}</b>\n` : ''}🏦 地址: <code>${shortAdd
 
     // 检测是否有变化
     const hasChanges = added.length > 0 || removed.length > 0 || changed.length > 0;
+
+    // 确保有定时报告基准时间（避免程序启动后立刻发送定时报告）
+    if (!lastReportTime.has(address)) {
+      lastReportTime.set(address, Date.now());
+    }
 
     // 始终保存最新状态（无论是否有变化）
     saveState(address, { positions, accountValue, totalPositionValue });
